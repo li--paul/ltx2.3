@@ -1,0 +1,75 @@
+diff --git a/packages/ltx-core/src/ltx_core/model/audio_vae/vocoder.py b/packages/ltx-core/src/ltx_core/model/audio_vae/vocoder.py
+index f78e3e8..0e389e2 100644
+--- a/packages/ltx-core/src/ltx_core/model/audio_vae/vocoder.py
++++ b/packages/ltx-core/src/ltx_core/model/audio_vae/vocoder.py
+@@ -1,6 +1,8 @@
+ import math
+ from typing import List
+ 
++import contextlib
++
+ import einops
+ import torch
+ import torch.nn.functional as F
+@@ -564,15 +566,17 @@ class VocoderWithBWE(nn.Module):
+         # compound through 108 sequential convolutions and degrade spectral
+         # metrics (mel_l1, MRSTFT) by 40-90% while perceptual quality (CDPAM)
+         # is unaffected.  fp32 eliminates this degradation.
+-        # We use autocast(dtype=float32) rather than self.float() because it
+-        # upcasts bf16 weights per-op at kernel level, avoiding the temporary
+-        # memory spike of self.float() / self.to(original_dtype).
+-        # Benchmarked on H100 (128.5M-param model):
+-        #   autocast fp32: +70 MB peak VRAM, 123 ms  (vs 482 MB / 95 ms for bf16)
+-        #   model.float(): +324 MB peak VRAM, 149 ms
+-        # Tested: both approaches produce bit-identical output.
+-
+-        with torch.autocast(device_type=mel_spec.device.type, dtype=torch.float32):
++        # On CUDA we use autocast(dtype=float32) to upcast bf16 weights per-op at
++        # kernel level, avoiding the temporary memory spike of self.float().
++        # XPU autocast does not support an fp32 target dtype (it silently
++        # disables autocast), so on other devices we upcast the module to fp32
++        # explicitly -- bit-identical output, slightly higher peak VRAM.
++        if mel_spec.device.type == "cuda":
++            fp32_ctx = torch.autocast(device_type=mel_spec.device.type, dtype=torch.float32)
++        else:
++            self.float()
++            fp32_ctx = contextlib.nullcontext()
++        with fp32_ctx:
+             x = self.vocoder(mel_spec.float())
+             _, _, length_low_rate = x.shape
+             output_length = length_low_rate * self.output_sampling_rate // self.input_sampling_rate
+diff --git a/packages/ltx-pipelines/src/ltx_pipelines/utils/gpu_model.py b/packages/ltx-pipelines/src/ltx_pipelines/utils/gpu_model.py
+index da8c0bf..b0fa85e 100644
+--- a/packages/ltx-pipelines/src/ltx_pipelines/utils/gpu_model.py
++++ b/packages/ltx-pipelines/src/ltx_pipelines/utils/gpu_model.py
+@@ -23,7 +23,10 @@ def gpu_model(model: _M) -> Iterator[_M]:
+     try:
+         yield model
+     finally:
+-        torch.cuda.synchronize()
++        if torch.cuda.is_available():
++            torch.cuda.synchronize()
++        if hasattr(torch, "xpu") and torch.xpu.is_available():
++            torch.xpu.synchronize()
+         # .to("meta") releases storage for all parameters/buffers regardless
+         # of their original device (CUDA or CPU).
+         model.to("meta")
+diff --git a/packages/ltx-pipelines/src/ltx_pipelines/utils/helpers.py b/packages/ltx-pipelines/src/ltx_pipelines/utils/helpers.py
+index 9960871..64034cb 100644
+--- a/packages/ltx-pipelines/src/ltx_pipelines/utils/helpers.py
++++ b/packages/ltx-pipelines/src/ltx_pipelines/utils/helpers.py
+@@ -35,8 +35,12 @@ def get_device() -> torch.device:
+ 
+ def cleanup_memory() -> None:
+     gc.collect()
+-    torch.cuda.empty_cache()
+-    torch.cuda.synchronize()
++    if torch.cuda.is_available():
++        torch.cuda.empty_cache()
++        torch.cuda.synchronize()
++    if hasattr(torch, "xpu") and torch.xpu.is_available():
++        torch.xpu.empty_cache()
++        torch.xpu.synchronize()
+     try:
+         if hasattr(torch._C, "_host_emptyCache"):
+             torch._C._host_emptyCache()
