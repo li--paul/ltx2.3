@@ -21,7 +21,7 @@ machine.
 7. [Prerequisites & setup](#prerequisites--setup)
 8. [Running](#running)
 9. [Configuration](#configuration)
-10. [Expected output & timings](#expected-output--timings)
+10. [Performance / Benchmarks](#performance--benchmarks)
 11. [Troubleshooting](#troubleshooting)
 12. [File layout](#file-layout)
 13. [Limitations & notes](#limitations--notes)
@@ -379,27 +379,90 @@ GDEV = torch.device("cpu")      # Gemma text encoder
 
 ---
 
-## Expected output & timings
+## Performance / Benchmarks
 
-For the default config (stage1 256×448, stage2 512×896, 41 frames @ 24 fps):
+Two configs were benchmarked end-to-end on the same machine (transformer on
+`xpu:0`, VAEs/decoders on `xpu:1`, Gemma-3-12B on CPU), both using the
+**distilled** two-stage pipeline with **fp8-cast** quantization. Timings are
+wall-clock, measured with `run_t2v_xpu_perf.py` (`time.perf_counter` per stage,
+with an `xpu` synchronize at each stage boundary).
+
+### Run A — small (default in `run_t2v_xpu.py`)
+
+stage1 256×448 → stage2 512×896, 41 frames @ 24 fps (1.71 s of video):
 
 | Stage | Time |
 |---|---|
-| Build fp8-cast policy | <0.1 s |
 | Prompt encode (Gemma 12B, CPU, 64 threads) | ~17 s |
-| Stage 1 transformer build + load | ~12 s |
-| Stage 1 denoise (8 steps) | ~8 s (~1.05 s/it) |
+| Stage 1 denoise (8 steps, incl. ~12 s build) | ~8 s (~1.05 s/it) |
 | Spatial upsample 2× | ~4 s |
-| Stage 2 transformer build + load | ~12 s |
-| Stage 2 denoise (3 steps) | ~6 s (~2.1 s/it) |
+| Stage 2 denoise (3 steps, incl. ~12 s build) | ~6 s (~2.1 s/it) |
 | Video + audio decode | ~10 s |
 | Mux to MP4 | ~3 s |
 | **Total** | **~75 s** |
 
-Output file (`output.mp4`):
-- Video: 896×512, 24 fps, 41 frames, 1.71 s
-- Audio: 48 kHz, stereo, 1.71 s (the joint model generates synchronized audio)
-- ~350 KB
+Output: 896×512, 24 fps, 41 frames, 1.71 s, 48 kHz stereo audio, ~350 KB.
+
+### Run B — 1024×1024, 121 frames
+
+stage1 512×512 → stage2 1024×1024, 121 frames @ 24 fps (5.04 s of video):
+
+| Stage | Time | % | Notes |
+|---|---:|---:|---|
+| Prompt encode (Gemma 12B, CPU) | 21.93 s | 14.4% | one forward pass, no generation |
+| Stage 1 denoise — 8 steps @ 512×512 | 41.13 s | 27.0% | ~2.95 s/step (incl. ~11.8 s build) |
+| Spatial upsample 2× | 2.60 s | 1.7% | on xpu:1 |
+| Stage 2 denoise — 3 steps @ 1024×1024 | 55.59 s | 36.5% | ~13.7 s/step (incl. ~11.6 s build) |
+| Video + audio decode | 11.92 s | 7.8% | tiled VAE decode (3 chunks) |
+| Mux to MP4 | 19.08 s | 12.5% | |
+| **Total** | **152.25 s** | | **~2.5 min** |
+
+Output (`sample-output-1024.mp4`): 1024×1024, 24 fps, 121 frames, 5.04 s,
+48 kHz stereo audio, 1.15 MB.
+
+### Comparison
+
+| | Run A (small) | Run B (1024²) |
+|---|---|---|
+| Output resolution | 896×512 | 1024×1024 |
+| Frames / duration | 41 / 1.71 s | 121 / 5.04 s |
+| Stage-2 video tokens | ~2,688 | ~16,384 |
+| Stage-2 step time | ~2.1 s | ~13.7 s |
+| Stage-2 total | ~6 s | 55.6 s |
+| **Total wall** | **~75 s** | **152.25 s** |
+| Throughput (video s / wall s) | 0.023× | 0.033× |
+
+### Memory
+
+Measured with a dedicated probe (build transformer on `xpu:0`, snapshot, free):
+
+| Device | Peak | Capacity |
+|---|---|---|
+| `xpu:0` (transformer, fp8-cast) | **18.12 GB allocated / 21.91 GB reserved** | 23.9 GB |
+| `xpu:1` (VAEs/decoders, during decode) | 0.77 GB | 23.9 GB |
+
+→ ~2 GB headroom on `xpu:0` for activations. The 1024²×121 run (16,384 tokens)
+**fit without OOM**. The next likely OOM point is pushing stage-2 resolution
+substantially higher (e.g. 1536²+) or many more frames.
+
+> Note: the `peak xpu:0` line printed by the run's own summary reads ~0.02 GB
+> because it is sampled *after* `gpu_model` frees the transformer. The 18.12 GB
+> figure above is the real resident footprint, from a separate probe.
+
+### Key takeaways
+
+- **Use `fp8-cast`, never `fp8-scaled-mm`, on Intel XPU** (see
+  [the fp8 question](#the-fp8-question-fp8-cast-vs-fp8-scaled-mm)). bf16 GEMM is
+  hardware-accelerated on Battlemage (~95 TFLOPS measured); fp8 `_scaled_mm` is
+  not, and falls back to a slow CPU path.
+- **Stage 2 is the bottleneck** (36.5% of total at 1024²). Attention is O(n²) in
+  tokens — tokens scaled 6.1× from Run A→B while stage-2 time scaled ~9.3×
+  (superlinear, as expected).
+- **Fixed overhead is material at small sizes** (prompt-encode + decode + mux =
+  ~53 s, 35% of Run B). For longer/higher-res jobs the diffusion stages
+  dominate more.
+- **Single-GPU suffices** for 1024²×121: the fp8 transformer (~18 GB) + activations
+  fit one 24 GB B60; the second B60 handles VAEs/decoders.
 
 ---
 
@@ -456,10 +519,14 @@ whole caching allocator. Call `torch.xpu.empty_cache()` (no arg).
 │   └── gemma-3-12b-it/
 └── ltx23-run/
     ├── README.md                       # this file
-    ├── run_t2v_xpu.py                  # the driver script
+    ├── run_t2v_xpu.py                  # the driver script (small default config)
+    ├── run_t2v_xpu_perf.py             # perf script with per-stage timing (1024² config)
     ├── download.py                     # model download helper
-    ├── run.log                         # last run's log
-    └── output.mp4                      # generated video (+ audio)
+    ├── patches/xpu.patch               # the three XPU patches
+    ├── sample-output.mp4               # Run A output (896×512, 41 frames)
+    ├── sample-output-1024.mp4          # Run B output (1024×1024, 121 frames)
+    ├── run.log / perf.log              # last run logs (gitignored)
+    └── output*.mp4                     # generated videos (gitignored)
 ```
 
 ---

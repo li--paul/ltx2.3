@@ -3,9 +3,10 @@
 # python
 __pycache__/
 *.pyc
-# generated run artifacts (sample-output.mp4 is committed separately)
-output.mp4
+# generated run artifacts (sample-output*.mp4 are committed separately)
+output*.mp4
 run.log
+perf.log
 # downloaded weights (never commit)
 *.safetensors
 gemma-3-12b-it/
