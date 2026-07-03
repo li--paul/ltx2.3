@@ -45,11 +45,12 @@ GEMMA_ROOT = "/home/lm/ltx23-models/gemma-3-12b-it"
 OUTPUT_PATH = "/home/lm/ltx23-run/output.mp4"
 
 # --- generation params (two-stage -> resolution divisible by 64) ---
-PROMPT = (
+_DEFAULT_PROMPT = (
     "A cinematic shot of a red panda sitting on a mossy branch in a misty bamboo forest, "
     "gentle morning light, soft bokeh, the panda turns its head and chews a bamboo leaf, "
     "photorealistic, 4k, shallow depth of field."
 )
+PROMPT = os.environ.get("LTX_PROMPT", _DEFAULT_PROMPT)
 SEED = 42
 STAGE1_H, STAGE1_W = 256, 448  # stage 2 -> 512 x 896
 NUM_FRAMES = 41  # must be 8k + 1
