@@ -257,35 +257,53 @@ xpu-smi discovery -d 0 | grep -E "Device Name|Memory Physical"
 already at `~/.local/bin/uv`.
 
 ### 2. Create the environment
+
+The exact, pinned environment is captured in `requirements.txt` (78 packages,
+including the `+xpu` torch build) and reproduced by `setup-env.sh`:
+
+```bash
+# Recreates /home/lm/ltx23-env (or set LTX_ENV=/path/to/venv):
+./setup-env.sh
+```
+
+`setup-env.sh` does, in order:
+1. `uv venv --python 3.12` at `$LTX_ENV` (default `/home/lm/ltx23-env`),
+2. installs `torch==2.12.1+xpu` / `torchvision==0.27.1+xpu` / `torchaudio==2.11.0+xpu`
+   from `https://download.pytorch.org/whl/xpu`,
+3. installs the rest of `requirements.txt` (PyPI, with the XPU index as
+   `--extra-index-url` so the `+xpu` local versions resolve),
+4. installs the LTX-2 packages editable (see step 4 below),
+5. verifies `torch.xpu` sees the GPUs.
+
+If you prefer to do it manually instead of using the script:
+
 ```bash
 uv venv --python 3.12 /home/lm/ltx23-env
 source /home/lm/ltx23-env/bin/activate
-```
-
-### 3. Install PyTorch (XPU build) and helpers
-```bash
-uv pip install torch torchvision torchaudio \
+uv pip install torch==2.12.1+xpu torchvision==0.27.1+xpu torchaudio==2.11.0+xpu \
     --index-url https://download.pytorch.org/whl/xpu
-uv pip install einops "scipy>=1.14" av tqdm pillow OpenImageIO \
-    "transformers>=4.52" accelerate sentencepiece safetensors imageio imageio-ffmpeg
+uv pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/xpu
 ```
 > Do **not** `uv sync` the LTX-2 repo root — its `pyproject.toml` pins a CUDA
 > PyTorch index (`cu129`) which would replace the XPU torch.
 
-### 4. Clone and install the LTX-2 packages (editable, no deps)
+### 3. Clone and install the LTX-2 packages (editable, no deps)
 ```bash
 git clone --depth 1 https://github.com/Lightricks/LTX-2.git /home/lm/LTX-2
 uv pip install --no-deps -e /home/lm/LTX-2/packages/ltx-core
 uv pip install --no-deps -e /home/lm/LTX-2/packages/ltx-pipelines
 ```
 Installing editable means the XPU patches you apply to the checkout take effect
-immediately.
+immediately. (`setup-env.sh` already runs these two if `/home/lm/LTX-2` exists.)
 
-### 5. Apply the three XPU patches
-Edit the three files described in [XPU patches](#xpu-patches-applied-to-the-ltx-2-repo).
-(They are already applied on this machine.)
+### 4. Apply the three XPU patches
+Edit the three files described in [XPU patches](#xpu-patches-applied-to-the-ltx-2-repo),
+or apply the committed patch directly:
+```bash
+cd /home/lm/LTX-2 && git apply /home/lm/ltx23-run/patches/xpu.patch
+```
 
-### 6. Download model artifacts
+### 5. Download model artifacts
 Three downloads (~48 GB total) into `/home/lm/ltx23-models/`:
 
 | File | Source repo | Size | Notes |
@@ -519,8 +537,12 @@ whole caching allocator. Call `torch.xpu.empty_cache()` (no arg).
 │   └── gemma-3-12b-it/
 └── ltx23-run/
     ├── README.md                       # this file
+    ├── requirements.txt                # pinned env (78 pkgs incl. +xpu torch)
+    ├── setup-env.sh                    # recreate the uv venv from requirements.txt
     ├── run_t2v_xpu.py                  # the driver script (small default config)
     ├── run_t2v_xpu_perf.py             # perf script with per-stage timing (1024² config)
+    ├── run.sh                          # launcher for the small config
+    ├── run_b.sh                        # launcher for the 1024²/121-frame config
     ├── download.py                     # model download helper
     ├── patches/xpu.patch               # the three XPU patches
     ├── sample-output.mp4               # Run A output (896×512, 41 frames)
