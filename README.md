@@ -5,8 +5,9 @@ generation on **Intel Arc Pro B60 (Battlemage) XPUs** using PyTorch's native XPU
 backend — no CUDA, no Diffusers, no ComfyUI required.
 
 This README documents a working setup that produces a synchronized
-**video + audio** MP4 from a text prompt using the first two B60 GPUs on the
-machine.
+**video + audio** MP4 from a text prompt using **four B60 GPUs** on the
+machine, with NUMA-aware device placement and model-parallel sharding of the
+Gemma text encoder.
 
 ---
 
@@ -86,43 +87,71 @@ portable to XPU with small patches (the repo targets CUDA).
 
 ## Solution architecture
 
+The pipeline runs on **four XPUs** organized into two NUMA groups with no
+cross-group traffic:
+
+| NUMA group | Device | Holds (one at a time) | Peak VRAM |
+|---|---|---|---|
+| **A** | `xpu:0` | fp8 distilled transformer (~18 GB) | ~22 GB |
+| **A** | `xpu:1` | video VAE, spatial upscaler, video/audio decoders | ~1 GB |
+| **B** | `xpu:2` | Gemma layers 0–23 + embeddings + vision tower | ~16.5 GB |
+| **B** | `xpu:3` | Gemma layers 24–47 + norm + lm_head | ~8.2 GB |
+
 The `ltx-pipelines` `DistilledPipeline` builds and frees each model sequentially
 inside a `gpu_model()` context manager — **only one model is ever resident on a
-device at a time**. Peak VRAM therefore equals the largest single model, not
-their sum. We exploit this to fit a 22B model across two 24 GB GPUs:
+device at a time** (group A). Peak VRAM on group A equals the largest single
+model (the fp8 transformer, ~18 GB), which fits a 24 GB B60.
 
-| Device | Holds (one at a time) | Peak VRAM |
-|---|---|---|
-| `xpu:0` | fp8 distilled transformer (~22 GB) | ~22 GB |
-| `xpu:1` | video VAE, spatial upscaler, video decoder, audio VAE+vocoder | a few GB |
-| `cpu` | Gemma-3-12B text encoder + embeddings processor | RAM only |
+### Gemma model parallelism (xpu:2 + xpu:3)
 
-**Why Gemma on CPU?** The text encoder is Gemma 3 12B (multimodal). In bf16 that's
-~24 GB — slightly more than a single 24 GB B60. Since the pipeline only runs one
-forward pass through Gemma (no generation, `enhance_prompt=False`), running it on
-CPU is the simplest robust choice (~17 s on 64 threads). It is freed before the
-transformer runs, so it never competes for XPU memory.
+The text encoder is **Gemma 3 12B** (multimodal). In bf16 that's ~26 GB — too
+large for a single 24 GB B60. Two options are supported:
 
-**Cross-device tensor moves.** For pure text-to-video there are no input images,
-so the image conditioner produces no conditioning latents. The only cross-device
-moves are:
-- prompt context: `cpu → xpu:0` (after encoding),
+1. **DP (default)** — Gemma is built on CPU, then sharded across `xpu:2 + xpu:3`
+   (NUMA group B) via `accelerate`'s `device_map` dispatch
+   (`infer_auto_device_map` + `dispatch_model`). The 48 decoder layers are split
+   ~24/24 across the two XPUs. The forward pass runs in **~0.8 s** (vs ~18 s on
+   CPU — a **22× speedup**). The embeddings processor then runs on `xpu:1`.
+   This keeps group B completely separate from group A — no cross-group tensor
+   transfers.
+
+2. **CPU fallback** — set `LTX_GEMMA_DEVICE=cpu`. Gemma runs entirely on CPU
+   (~18 s forward, 128 cores). Simpler but slower; useful if xpu:2/xpu:3 are
+   unavailable or occupied.
+
+The DP path has a one-time **dispatch overhead** (~45 s to shard 26 GB from CPU
+→ 2 XPUs). For a single prompt this makes DP slower end-to-end (120 s vs 75 s),
+but if the model is kept resident for **≥3 sequential prompts**, DP amortizes
+the dispatch and wins.
+
+### Cross-device tensor moves
+
+For pure text-to-video there are no input images, so the image conditioner
+produces no conditioning latents. The only cross-device moves are:
+- prompt context: `xpu:2/3 (or cpu) → xpu:0` (after encoding),
 - video/audio latents: `xpu:0 ↔ xpu:1` between stages and before decode.
 
-The driver script `run_t2v_xpu.py` replicates `DistilledPipeline.__call__` with
-these per-block device assignments and moves.
+All moves stay within their NUMA group — no A↔B traffic.
 
 ```
-PromptEncoder(cpu) ──context──▶ DiffusionStage(xpu:0, fp8)
-                                      │  stage-1 latents
-                                      ▼
-                          VideoUpsampler(xpu:1) ──upscaled latent──▶ xpu:0
-                                      │  stage-2 latents
-                                      ▼
-                   VideoDecoder(xpu:1) ◀──latent──  +  AudioDecoder(xpu:1)
-                                      │
-                                      ▼
-                                encode_video → output.mp4
+                    ┌── NUMA Group A ──┐         ┌── NUMA Group B ──┐
+                    │                  │         │                  │
+DPPromptEncoder ───▶│  xpu:2 + xpu:3   │         │                  │
+  (Gemma sharded)   │  ~0.8 s forward  │         │                  │
+                    └──────┬───────────┘         │                  │
+                           │ context             │                  │
+                           ▼                     │                  │
+                DiffusionStage(xpu:0, fp8)       │                  │
+                    │  stage-1 latents           │                  │
+                    ▼                            │                  │
+          VideoUpsampler(xpu:1) ──upscaled──▶ xpu:0                │
+                    │  stage-2 latents           │                  │
+                    ▼                            │                  │
+         VideoDecoder(xpu:1) ◀──latent── + AudioDecoder(xpu:1)     │
+                    │                            │                  │
+                    ▼                            │                  │
+              encode_video → output.mp4          │                  │
+                                               └──────────────────┘
 ```
 
 ---
@@ -351,6 +380,21 @@ print('weight_scale keys:', sum(k.endswith('.weight_scale') for k in h))
 
 ## Running
 
+### Shell launchers (easiest)
+
+```bash
+# Small config (896×512, 41 frames, ~75-120s depending on Gemma mode):
+./run.sh                              # default prompt, DP Gemma
+./run.sh "a dog surfing a wave"       # custom prompt
+LTX_GEMMA_DEVICE=cpu ./run.sh         # fall back to CPU Gemma (faster for single shot)
+
+# 1024×1024, 121 frames (~2.5 min):
+./run_b.sh
+./run_b.sh "neon city at night"
+```
+
+### Direct Python
+
 ```bash
 source /home/lm/ltx23-env/bin/activate
 cd /home/lm/ltx23-run
@@ -359,6 +403,8 @@ HF_HUB_OFFLINE=1 TOKENIZERS_PARALLELISM=false python run_t2v_xpu.py
 
 - `HF_HUB_OFFLINE=1` — prevents any network call mid-run (all weights are local).
 - `TOKENIZERS_PARALLELISM=false` — silences a tokenizer warning.
+- `LTX_GEMMA_DEVICE=cpu` — use CPU for Gemma instead of DP sharding (faster for
+  a single shot since it avoids the 45 s dispatch overhead).
 
 Output: `/home/lm/ltx23-run/output.mp4`.
 
@@ -397,22 +443,28 @@ or frame count first.
 
 Devices are also constants:
 ```python
-TDEV = torch.device("xpu", 0)   # transformer
-CDEV = torch.device("xpu", 1)   # VAE / decoders
-GDEV = torch.device("cpu")      # Gemma text encoder
+TDEV = torch.device("xpu", 0)           # transformer (NUMA group A)
+CDEV = torch.device("xpu", 1)           # VAE / decoders (NUMA group A)
+GEMMA_DP_DEVICES = (2, 3)               # Gemma DP sharding (NUMA group B)
+USE_DP_GEMMA = True                     # DPPromptEncoder by default
 ```
+
+**Environment variables:**
+| Variable | Default | Effect |
+|---|---|---|
+| `LTX_PROMPT` | *(built-in red-panda prompt)* | Override the text prompt |
+| `LTX_GEMMA_DEVICE` | `xpu` | Set to `cpu` to run Gemma on CPU instead of DP sharding |
 
 ---
 
 ## Performance / Benchmarks
 
-Two configs were benchmarked end-to-end on the same machine (transformer on
-`xpu:0`, VAEs/decoders on `xpu:1`, Gemma-3-12B on CPU), both using the
+Three runs were benchmarked end-to-end on the same machine, all using the
 **distilled** two-stage pipeline with **fp8-cast** quantization. Timings are
 wall-clock, measured with `run_t2v_xpu_perf.py` (`time.perf_counter` per stage,
 with an `xpu` synchronize at each stage boundary).
 
-### Run A — small (default in `run_t2v_xpu.py`)
+### Run A — small, Gemma on CPU (default config)
 
 stage1 256×448 → stage2 512×896, 41 frames @ 24 fps (1.71 s of video):
 
@@ -428,7 +480,7 @@ stage1 256×448 → stage2 512×896, 41 frames @ 24 fps (1.71 s of video):
 
 Output: 896×512, 24 fps, 41 frames, 1.71 s, 48 kHz stereo audio, ~350 KB.
 
-### Run B — 1024×1024, 121 frames
+### Run B — 1024×1024, 121 frames, Gemma on CPU
 
 stage1 512×512 → stage2 1024×1024, 121 frames @ 24 fps (5.04 s of video):
 
@@ -445,26 +497,62 @@ stage1 512×512 → stage2 1024×1024, 121 frames @ 24 fps (5.04 s of video):
 Output (`sample-output-1024.mp4`): 1024×1024, 24 fps, 121 frames, 5.04 s,
 48 kHz stereo audio, 1.15 MB.
 
+### Run C — small, Gemma DP on xpu:2+xpu:3
+
+Same output config as Run A (stage1 256×448 → stage2 512×896, 41 frames), but
+with Gemma sharded across `xpu:2 + xpu:3` via `accelerate` model parallelism:
+
+| Stage | Time | Notes |
+|---|---:|---|
+| Gemma build (CPU) | ~2 s | load weights to CPU |
+| Dispatch (shard 26 GB → xpu:2+3) | ~34 s | one-time overhead |
+| Gemma forward (2 XPUs) | ~0.8 s | **22× faster than CPU's 18 s** |
+| Gemma free + cleanup | ~11 s | remove hooks, move to meta |
+| Embeddings processor (xpu:1) | ~7 s | |
+| Stage 1 denoise (8 steps) | ~27 s | same as Run A |
+| Stage 2 denoise (3 steps) | ~22 s | same as Run A |
+| Decode + mux | ~12 s | same as Run A |
+| **Total** | **~120 s** | |
+
+Output: identical to Run A (896×512, 41 frames, same seed → same content).
+
 ### Comparison
 
-| | Run A (small) | Run B (1024²) |
+| | Run A (CPU) | Run B (CPU, 1024²) | Run C (DP, small) |
+|---|---|---|---|
+| Output resolution | 896×512 | 1024×1024 | 896×512 |
+| Frames / duration | 41 / 1.71 s | 121 / 5.04 s | 41 / 1.71 s |
+| Gemma device | CPU | CPU | xpu:2+3 (DP) |
+| Gemma forward | ~18 s | ~18 s | **~0.8 s** |
+| Gemma dispatch overhead | 0 | 0 | ~45 s |
+| Prompt encode total | ~20 s | ~22 s | ~55 s |
+| Stage-2 total | ~6 s | 55.6 s | ~6 s |
+| **Total wall** | **~75 s** | **152.25 s** | **~120 s** |
+
+### Gemma DP tradeoff
+
+| Metric | CPU | DP (xpu:2+3) |
 |---|---|---|
-| Output resolution | 896×512 | 1024×1024 |
-| Frames / duration | 41 / 1.71 s | 121 / 5.04 s |
-| Stage-2 video tokens | ~2,688 | ~16,384 |
-| Stage-2 step time | ~2.1 s | ~13.7 s |
-| Stage-2 total | ~6 s | 55.6 s |
-| **Total wall** | **~75 s** | **152.25 s** |
-| Throughput (video s / wall s) | 0.023× | 0.033× |
+| Forward pass | 18 s | **0.8 s (22× faster)** |
+| One-time dispatch | 0 | 45 s (shard 26 GB) |
+| Single-prompt total | **75 s** ✅ | 120 s |
+| Per-prompt (model resident) | 18 s | **0.8 s** ✅ |
+| Break-even | — | ≥3 sequential prompts |
+
+DP is slower for a single shot (the 45 s dispatch dominates), but if the model
+is kept resident across prompts the per-prompt forward drops from 18 s to 0.8 s.
+Use `LTX_GEMMA_DEVICE=cpu` to fall back to CPU mode.
 
 ### Memory
 
-Measured with a dedicated probe (build transformer on `xpu:0`, snapshot, free):
+Measured with dedicated probes (build model on target device, snapshot, free):
 
 | Device | Peak | Capacity |
 |---|---|---|
 | `xpu:0` (transformer, fp8-cast) | **18.12 GB allocated / 21.91 GB reserved** | 23.9 GB |
 | `xpu:1` (VAEs/decoders, during decode) | 0.77 GB | 23.9 GB |
+| `xpu:2` (Gemma layers 0–23) | 16.51 GB | 23.9 GB |
+| `xpu:3` (Gemma layers 24–47) | 8.17 GB | 23.9 GB |
 
 → ~2 GB headroom on `xpu:0` for activations. The 1024²×121 run (16,384 tokens)
 **fit without OOM**. The next likely OOM point is pushing stage-2 resolution
@@ -480,14 +568,18 @@ substantially higher (e.g. 1536²+) or many more frames.
   [the fp8 question](#the-fp8-question-fp8-cast-vs-fp8-scaled-mm)). bf16 GEMM is
   hardware-accelerated on Battlemage (~95 TFLOPS measured); fp8 `_scaled_mm` is
   not, and falls back to a slow CPU path.
-- **Stage 2 is the bottleneck** (36.5% of total at 1024²). Attention is O(n²) in
-  tokens — tokens scaled 6.1× from Run A→B while stage-2 time scaled ~9.3×
-  (superlinear, as expected).
+- **Stage 2 is the compute bottleneck** (36.5% of total at 1024²). Attention is
+  O(n²) in tokens — tokens scaled 6.1× from Run A→B while stage-2 time scaled
+  ~9.3× (superlinear, as expected).
+- **Gemma DP gives 22× faster forward** (0.8 s vs 18 s) but has a 45 s one-time
+  dispatch overhead. Use DP for batch/interactive workloads (≥3 prompts with
+  model resident); use CPU for single-shot runs.
+- **NUMA-aware placement matters.** Group A (xpu:0+1) runs the transformer +
+  VAEs; group B (xpu:2+3) runs the sharded Gemma. No cross-group tensor
+  transfers. Mixing devices across groups would incur high PCIe latency.
 - **Fixed overhead is material at small sizes** (prompt-encode + decode + mux =
   ~53 s, 35% of Run B). For longer/higher-res jobs the diffusion stages
   dominate more.
-- **Single-GPU suffices** for 1024²×121: the fp8 transformer (~18 GB) + activations
-  fit one 24 GB B60; the second B60 handles VAEs/decoders.
 
 ---
 
@@ -502,9 +594,11 @@ editable install means editing the file is enough; no reinstall needed.
 policy must be `from ltx_core.quantization.fp8_cast import build_policy as
 fp8_cast_policy`. See [the fp8 question](#the-fp8-question-fp8-cast-vs-fp8-scaled-mm).
 
-**`XPU out of memory` during Gemma forward on xpu:1**
-→ Gemma 12B bf16 (~24 GB) doesn't fit one B60. Keep `GDEV = torch.device("cpu")`
-for the `PromptEncoder`. (If you have a GPU with ≥32 GB, you can move it there.)
+**`XPU out of memory` during Gemma forward on a single XPU**
+→ Gemma 12B bf16 (~26 GB) doesn't fit one 24 GB B60. The driver uses DP model
+parallelism across `xpu:2 + xpu:3` by default (`DPPromptEncoder`). To fall back
+to CPU: `LTX_GEMMA_DEVICE=cpu ./run.sh`. (If you have a GPU with ≥32 GB, you can
+move it there by setting `GDEV` in the script.)
 
 **`torch.cuda.is_available()` / `torch.cuda.synchronize()` crashes**
 → Patches #1 and #2 are missing. Re-apply them.
@@ -548,8 +642,9 @@ whole caching allocator. Call `torch.xpu.empty_cache()` (no arg).
     ├── uv.lock                         # fully-pinned lockfile (77 packages)
     ├── requirements.txt                # pip-freeze fallback (same pins)
     ├── setup-env.sh                    # `uv sync` to recreate the venv
-    ├── run_t2v_xpu.py                  # the driver script (small default config)
+    ├── run_t2v_xpu.py                  # driver script (DP Gemma by default)
     ├── run_t2v_xpu_perf.py             # perf script with per-stage timing (1024² config)
+    ├── dp_prompt_encoder.py            # Gemma model-parallel across xpu:2+xpu:3
     ├── run.sh                          # launcher for the small config
     ├── run_b.sh                        # launcher for the 1024²/121-frame config
     ├── download.py                     # model download helper
@@ -572,11 +667,15 @@ whole caching allocator. Call `torch.xpu.empty_cache()` (no arg).
   and is much slower; the bf16 `dev` model (~44 GB) also won't fit two 24 GB GPUs
   without sharding or the `OffloadMode.CPU` path (which would need the
   XPU-stream patches mentioned above).
-- **Single-GPU sharding is not used.** The transformer runs entirely on `xpu:0`;
-  `xpu:1` handles the VAEs/decoders. Because models are sequential, this still
-  uses both XPUs and keeps each within budget. True transformer sharding across
-  XPUs would require the repo's multi-GPU builder and is out of scope here.
+- **Single-GPU sharding is not used for the transformer.** The transformer runs
+  entirely on `xpu:0`; `xpu:1` handles the VAEs/decoders. Because models are
+  sequential, this still uses both XPUs in group A and keeps each within budget.
+  Gemma, however, **is** sharded across `xpu:2 + xpu:3` (group B) via
+  `accelerate` model parallelism. True transformer sharding across XPUs would
+  require the repo's multi-GPU builder and is out of scope here.
 - **Prompt enhancement is off** (`enhance_prompt=False`) to avoid Gemma
-  *generation* on CPU (slow). Turn it on only if Gemma runs on a GPU.
+  *generation* (autoregressive, many forward passes). The DP encoder supports it
+  but it would be slow due to sequential layer-by-layer generation across the
+  shard boundary. Turn it on only for CPU mode or if latency is acceptable.
 - **No commits were made** to the LTX-2 checkout; the three patches are applied
   in-place to the editable install.
