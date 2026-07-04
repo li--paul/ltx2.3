@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # Recreate the LTX-2.3 XPU Python environment with uv.
 #
-# Produces a venv at $LTX_ENV (default /home/lm/ltx23-env) with the exact
-# pinned package set in requirements.txt, including the +xpu torch build.
+# Primary method: `uv sync` from pyproject.toml + uv.lock (fully reproducible).
+# Fallback:      `uv pip install -r requirements.txt` (same pins, less strict).
+#
+# Produces a venv at $LTX_ENV (default /home/lm/ltx23-env).
 #
 # Usage:
-#   ./setup-env.sh                       # default path /home/lm/ltx23-env
+#   ./setup-env.sh                       # default path
 #   LTX_ENV=/path/to/venv ./setup-env.sh # custom path
 #
 # Prerequisites:
@@ -15,33 +17,28 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$HERE"
 LTX_ENV="${LTX_ENV:-/home/lm/ltx23-env}"
-XPU_INDEX="https://download.pytorch.org/whl/xpu"
+LTX_REPO="${LTX_REPO:-/home/lm/LTX-2}"
 
-echo ">> Creating venv at $LTX_ENV (python 3.12)"
-uv venv --python 3.12 "$LTX_ENV"
-# shellcheck disable=SC1091
-source "$LTX_ENV/bin/activate"
+echo ">> Syncing environment from uv.lock -> $LTX_ENV"
+UV_PROJECT_ENVIRONMENT="$LTX_ENV" uv sync
 
-echo ">> Installing torch/torchvision/torchaudio (+xpu) from $XPU_INDEX"
-uv pip install \
-    "torch==2.12.1+xpu" "torchvision==0.27.1+xpu" "torchaudio==2.11.0+xpu" \
-    --index-url "$XPU_INDEX"
-
-echo ">> Installing pinned dependencies from requirements.txt"
-# +xpu local versions resolve via the extra index; everything else from PyPI.
-uv pip install -r "$HERE/requirements.txt" \
-    --extra-index-url "$XPU_INDEX"
-
-echo ">> Installing LTX-2 packages (editable, no deps to avoid CUDA torch pins)"
-if [[ -d /home/lm/LTX-2 ]]; then
-    uv pip install --no-deps -e /home/lm/LTX-2/packages/ltx-core
-    uv pip install --no-deps -e /home/lm/LTX-2/packages/ltx-pipelines
+# uv sync installs everything in the lockfile but NOT the LTX-2 packages
+# (they're an external checkout with conflicting CUDA torch pins, so they
+# are intentionally excluded from pyproject.toml). Install them manually:
+echo ">> Installing LTX-2 packages editable (no-deps)"
+if [[ -d "$LTX_REPO" ]]; then
+    UV_PROJECT_ENVIRONMENT="$LTX_ENV" uv pip install --no-deps -e "$LTX_REPO/packages/ltx-core"
+    UV_PROJECT_ENVIRONMENT="$LTX_ENV" uv pip install --no-deps -e "$LTX_REPO/packages/ltx-pipelines"
 else
-    echo "   (skipped: /home/lm/LTX-2 not present — clone Lightricks/LTX-2 first)"
+    echo "   (skipped: $LTX_REPO not present — clone Lightricks/LTX-2 first)"
+    echo "   git clone --depth 1 https://github.com/Lightricks/LTX-2.git $LTX_REPO"
 fi
 
 echo ">> Verifying torch sees the XPUs"
+# shellcheck disable=SC1091
+source "$LTX_ENV/bin/activate"
 python - <<'PY'
 import torch
 print("torch", torch.__version__)

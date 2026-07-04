@@ -1,0 +1,61 @@
+[project]
+name = "ltx23-xpu"
+version = "0.1.0"
+description = "Run Lightricks LTX-2.3 text-to-video on Intel Arc Pro B60 (XPU)"
+requires-python = ">=3.12,<3.13"
+
+# Torch trio: pinned to the +xpu build via [tool.uv.sources] below.
+dependencies = [
+    "torch==2.12.1+xpu",
+    "torchvision==0.27.1+xpu",
+    "torchaudio==2.11.0+xpu",
+    # app deps (PyPI)
+    "accelerate==1.14.0",
+    "av==18.0.0",
+    "diffusers==0.38.0",
+    "einops==0.8.2",
+    "imageio==2.37.3",
+    "imageio-ffmpeg==0.6.0",
+    "openimageio==3.1.15.0",
+    "pillow==12.3.0",
+    "safetensors==0.8.0",
+    "scipy==1.18.0",
+    "sentencepiece==0.2.1",
+    "tokenizers==0.22.2",
+    "tqdm==4.68.3",
+    "transformers==5.12.1",
+]
+
+[tool.uv]
+# Consider versions from ALL indexes (PyPI + the XPU index) rather than
+# locking a package to whichever index lists it first. Both indexes are
+# trusted official sources, so the dependency-confusion protection uv
+# applies by default is unnecessary here and would block resolution
+# (e.g. pillow is on both indexes but at different versions).
+index-strategy = "unsafe-best-match"
+
+# The Intel runtime wheels (intel-sycl-rt, intel-cmplr-lib-rt, oneccl,
+# onemkl-*, triton-xpu, tbb, umf, ...) are transitive deps of the +xpu
+# torch wheels and are served from the same XPU index — they resolve
+# automatically, so they are NOT listed in [project.dependencies].
+#
+# The LTX-2 packages (ltx-core, ltx-pipelines) are installed editable from
+# an external checkout with --no-deps (their pyproject pins a CUDA torch
+# index that would conflict with the XPU build). Install them manually:
+#   uv pip install --no-deps -e /path/to/LTX-2/packages/ltx-core
+#   uv pip install --no-deps -e /path/to/LTX-2/packages/ltx-pipelines
+# See setup-env.sh.
+
+[tool.uv.sources]
+torch = { index = "pytorch-xpu" }
+torchvision = { index = "pytorch-xpu" }
+torchaudio = { index = "pytorch-xpu" }
+
+[[tool.uv.index]]
+name = "pytorch-xpu"
+url = "https://download.pytorch.org/whl/xpu"
+# NOT explicit: torch+xpu's transitive deps (triton-xpu, intel-sycl-rt,
+# intel-cmplr-lib-rt, oneccl, onemkl-*, tbb, umf, ...) live on this index
+# too, so uv must search it for those packages. Common PyPI packages
+# (numpy, pillow, ...) are absent from this index and still resolve from
+# PyPI. The [tool.uv.sources] mapping pins only the torch trio here.

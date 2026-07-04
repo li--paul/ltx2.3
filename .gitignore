@@ -3,6 +3,7 @@
 # python
 __pycache__/
 *.pyc
+.venv/
 # generated run artifacts (sample-output*.mp4 are committed separately)
 output*.mp4
 run.log

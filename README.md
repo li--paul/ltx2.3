@@ -258,26 +258,31 @@ already at `~/.local/bin/uv`.
 
 ### 2. Create the environment
 
-The exact, pinned environment is captured in `requirements.txt` (78 packages,
-including the `+xpu` torch build) and reproduced by `setup-env.sh`:
+The environment is defined by a uv `pyproject.toml` (dependency spec + the XPU
+index config) and a fully-pinned `uv.lock` (77 packages, including
+`torch==2.12.1+xpu` and its Intel runtime transitive deps). Recreate it with
+one command:
 
 ```bash
-# Recreates /home/lm/ltx23-env (or set LTX_ENV=/path/to/venv):
+# Creates the venv at /home/lm/ltx23-env (or set LTX_ENV=/path/to/venv):
 ./setup-env.sh
 ```
 
 `setup-env.sh` does, in order:
-1. `uv venv --python 3.12` at `$LTX_ENV` (default `/home/lm/ltx23-env`),
-2. installs `torch==2.12.1+xpu` / `torchvision==0.27.1+xpu` / `torchaudio==2.11.0+xpu`
-   from `https://download.pytorch.org/whl/xpu`,
-3. installs the rest of `requirements.txt` (PyPI, with the XPU index as
-   `--extra-index-url` so the `+xpu` local versions resolve),
-4. installs the LTX-2 packages editable (see step 4 below),
-5. verifies `torch.xpu` sees the GPUs.
+1. `uv sync` — installs all 77 locked packages from `uv.lock` into `$LTX_ENV`,
+   including `torch==2.12.1+xpu` / `torchvision==0.27.1+xpu` /
+   `torchaudio==2.11.0+xpu` (via the `pytorch-xpu` index declared in
+   `pyproject.toml`), plus the Intel runtime wheels (`intel-sycl-rt`,
+   `intel-cmplr-lib-rt`, `oneccl`, `onemkl-*`, `triton-xpu`, `tbb`, `umf`, …)
+   that come in as torch's transitive dependencies,
+2. installs the LTX-2 packages editable with `--no-deps` (see step 3 below),
+3. verifies `torch.xpu` sees the GPUs.
 
-If you prefer to do it manually instead of using the script:
+If you prefer to do it manually:
 
 ```bash
+UV_PROJECT_ENVIRONMENT=/home/lm/ltx23-env uv sync
+# or, without the lockfile:
 uv venv --python 3.12 /home/lm/ltx23-env
 source /home/lm/ltx23-env/bin/activate
 uv pip install torch==2.12.1+xpu torchvision==0.27.1+xpu torchaudio==2.11.0+xpu \
@@ -285,7 +290,9 @@ uv pip install torch==2.12.1+xpu torchvision==0.27.1+xpu torchaudio==2.11.0+xpu 
 uv pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/xpu
 ```
 > Do **not** `uv sync` the LTX-2 repo root — its `pyproject.toml` pins a CUDA
-> PyTorch index (`cu129`) which would replace the XPU torch.
+> PyTorch index (`cu129`) which would replace the XPU torch. The LTX-2 packages
+> are deliberately excluded from this repo's `pyproject.toml` for the same
+> reason; they're installed separately with `--no-deps`.
 
 ### 3. Clone and install the LTX-2 packages (editable, no deps)
 ```bash
@@ -537,8 +544,10 @@ whole caching allocator. Call `torch.xpu.empty_cache()` (no arg).
 │   └── gemma-3-12b-it/
 └── ltx23-run/
     ├── README.md                       # this file
-    ├── requirements.txt                # pinned env (78 pkgs incl. +xpu torch)
-    ├── setup-env.sh                    # recreate the uv venv from requirements.txt
+    ├── pyproject.toml                  # uv project: deps + XPU index config
+    ├── uv.lock                         # fully-pinned lockfile (77 packages)
+    ├── requirements.txt                # pip-freeze fallback (same pins)
+    ├── setup-env.sh                    # `uv sync` to recreate the venv
     ├── run_t2v_xpu.py                  # the driver script (small default config)
     ├── run_t2v_xpu_perf.py             # perf script with per-stage timing (1024² config)
     ├── run.sh                          # launcher for the small config
