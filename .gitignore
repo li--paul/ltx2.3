@@ -12,3 +12,5 @@ perf.log
 *.safetensors
 gemma-3-12b-it/
 .cache/
+test_gemma_dp.py
+gemma_dp.log
