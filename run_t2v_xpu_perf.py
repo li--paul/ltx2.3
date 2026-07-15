@@ -40,10 +40,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("ltx23")
 
 # --- paths ---
-DISTILLED_CKPT = "/home/lm/ltx23-models/ltx-2.3-22b-distilled-fp8.safetensors"
-UPSCALER_CKPT = "/home/lm/ltx23-models/ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
-GEMMA_ROOT = "/home/lm/ltx23-models/gemma-3-12b-it"
-OUTPUT_PATH = "/home/lm/ltx23-run/output_1024.mp4"
+DISTILLED_CKPT = "/home/lm/paul/ltx23-models/ltx-2.3-22b-distilled-fp8.safetensors"
+UPSCALER_CKPT = "/home/lm/paul/ltx23-models/ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
+GEMMA_ROOT = "/home/lm/paul/ltx23-models/gemma-3-12b-it"
+OUTPUT_PATH = os.environ.get("LTX_OUTPUT_PATH", "/home/lm/paul/ltx23-run/output_1024.mp4")
 
 # --- generation params (two-stage -> resolution divisible by 64) ---
 _DEFAULT_PROMPT = (
@@ -52,13 +52,14 @@ _DEFAULT_PROMPT = (
     "photorealistic, 4k, shallow depth of field."
 )
 PROMPT = os.environ.get("LTX_PROMPT", _DEFAULT_PROMPT)
+EMBEDDINGS_PATH = os.environ.get("LTX_EMBEDDINGS_PATH", "")
 SEED = 42
 STAGE1_H, STAGE1_W = 512, 512  # stage 2 -> 1024 x 1024
 NUM_FRAMES = 121  # 8*15 + 1  -> ~5.0 s @ 24 fps
 FRAME_RATE = 24.0
 
-TDEV = torch.device("xpu", 0)  # transformer
-CDEV = torch.device("xpu", 1)  # vae / decoders
+TDEV = torch.device("xpu", int(os.environ.get("LTX_TDEV", "0")))  # transformer
+CDEV = torch.device("xpu", int(os.environ.get("LTX_CDEV", "1")))  # vae / decoders
 GDEV = torch.device("cpu")  # Gemma text encoder (does not fit a single 24GB B60 in bf16)
 
 
@@ -142,13 +143,20 @@ def main() -> None:
     decode_generator = torch.Generator(device=CDEV).manual_seed(SEED)
 
     # --- prompt encoding (cpu) ---
-    with _Timer("prompt-encode (cpu)", CDEV):
-        log.info("encoding prompt on %s", GDEV)
-        (ctx_p,) = prompt_encoder([PROMPT], enhance_first_prompt=False, enhance_prompt_image=None)
-    _mem("after prompt-encode", CDEV)
-    # move context to transformer device
-    video_context = ctx_p.video_encoding.to(TDEV)
-    audio_context = ctx_p.audio_encoding.to(TDEV)
+    if EMBEDDINGS_PATH:
+        log.info("loading pre-encoded embeddings from %s", EMBEDDINGS_PATH)
+        data = torch.load(EMBEDDINGS_PATH, map_location="cpu", weights_only=True)
+        video_context = data["video_encoding"].to(TDEV)
+        audio_context = data["audio_encoding"].to(TDEV)
+        del data
+    else:
+        with _Timer("prompt-encode (cpu)", CDEV):
+            log.info("encoding prompt on %s", GDEV)
+            (ctx_p,) = prompt_encoder([PROMPT], enhance_first_prompt=False, enhance_prompt_image=None)
+        _mem("after prompt-encode", CDEV)
+        # move context to transformer device
+        video_context = ctx_p.video_encoding.to(TDEV)
+        audio_context = ctx_p.audio_encoding.to(TDEV)
 
     stage_1_sigmas = DISTILLED_SIGMAS.to(dtype=torch.float32, device=TDEV)
     stage_2_sigmas = STAGE_2_DISTILLED_SIGMAS.to(dtype=torch.float32, device=TDEV)

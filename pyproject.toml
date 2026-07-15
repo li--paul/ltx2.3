@@ -24,6 +24,8 @@ dependencies = [
     "tokenizers==0.22.2",
     "tqdm==4.68.3",
     "transformers==5.12.1",
+    "fastapi>=0.139.0",
+    "uvicorn>=0.51.0",
 ]
 
 [tool.uv]

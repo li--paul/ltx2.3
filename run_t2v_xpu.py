@@ -47,10 +47,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("ltx23")
 
 # --- paths ---
-DISTILLED_CKPT = "/home/lm/ltx23-models/ltx-2.3-22b-distilled-fp8.safetensors"
-UPSCALER_CKPT = "/home/lm/ltx23-models/ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
-GEMMA_ROOT = "/home/lm/ltx23-models/gemma-3-12b-it"
-OUTPUT_PATH = "/home/lm/ltx23-run/output.mp4"
+DISTILLED_CKPT = "/home/lm/paul/ltx23-models/ltx-2.3-22b-distilled-fp8.safetensors"
+UPSCALER_CKPT = "/home/lm/paul/ltx23-models/ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
+GEMMA_ROOT = "/home/lm/paul/ltx23-models/gemma-3-12b-it"
+OUTPUT_PATH = os.environ.get("LTX_OUTPUT_PATH", "/home/lm/paul/ltx23-run/output.mp4")
 
 # --- generation params (two-stage -> resolution divisible by 64) ---
 _DEFAULT_PROMPT = (
