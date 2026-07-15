@@ -60,8 +60,10 @@ _DEFAULT_PROMPT = (
 )
 PROMPT = os.environ.get("LTX_PROMPT", _DEFAULT_PROMPT)
 SEED = 42
-STAGE1_H, STAGE1_W = 256, 448  # stage 2 -> 512 x 896
-NUM_FRAMES = 41  # must be 8k + 1
+_TARGET_W = int(os.environ.get("LTX_WIDTH", "1024"))
+_TARGET_H = int(os.environ.get("LTX_HEIGHT", "1024"))
+STAGE1_W, STAGE1_H = _TARGET_W // 2, _TARGET_H // 2  # stage 2 -> target
+NUM_FRAMES = int(os.environ.get("LTX_FRAMES", "73"))  # must be 8k + 1
 FRAME_RATE = 24.0
 
 TDEV = torch.device("xpu", 0)  # transformer

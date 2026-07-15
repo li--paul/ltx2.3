@@ -1,27 +1,24 @@
 #!/usr/bin/env bash
-# Launch LTX-2.3 text-to-video Run B: 1024x1024, 121 frames @ 24 fps (~5.0s clip).
-# Uses the distilled two-stage pipeline with per-stage timing.
-#
+# Launch LTX-2.3 text-to-video Run B: 1024x1024, 121 frames ~5.0s clip.
 # Usage:
-#   ./run_b.sh                      # default red-panda prompt
-#   ./run_b.sh "your prompt here"   # custom prompt (via arg or LTX_PROMPT env)
-#   LTX_PROMPT="..." ./run_b.sh
+#   ./run_b.sh                      # default (1024x1024, 121 frames)
+#   ./run_b.sh "your prompt here"
 #
 # Output: output_1024.mp4 in this directory.
-# Expected wall time: ~2.5 min (see README "Performance / Benchmarks").
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$HERE"
 
-# --- activate the uv venv ---
 source /home/lm/ltx23-env/bin/activate
 
-# --- env ---
-export HF_HUB_OFFLINE=1                 # all weights are local; no network calls
+export HF_HUB_OFFLINE=1
 export TOKENIZERS_PARALLELISM=false
+export LTX_GEMMA_DEVICE=cpu
+export LTX_WIDTH="${LTX_WIDTH:-1024}"
+export LTX_HEIGHT="${LTX_HEIGHT:-1024}"
+export LTX_FRAMES="${LTX_FRAMES:-121}"
 
-# allow overriding the prompt from the first arg or an env var
 if [[ $# -ge 1 ]]; then
     export LTX_PROMPT="$1"
 fi

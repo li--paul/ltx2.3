@@ -54,8 +54,10 @@ _DEFAULT_PROMPT = (
 PROMPT = os.environ.get("LTX_PROMPT", _DEFAULT_PROMPT)
 EMBEDDINGS_PATH = os.environ.get("LTX_EMBEDDINGS_PATH", "")
 SEED = 42
-STAGE1_H, STAGE1_W = 512, 512  # stage 2 -> 1024 x 1024
-NUM_FRAMES = 121  # 8*15 + 1  -> ~5.0 s @ 24 fps
+_TARGET_W = int(os.environ.get("LTX_WIDTH", "1024"))
+_TARGET_H = int(os.environ.get("LTX_HEIGHT", "1024"))
+STAGE1_H, STAGE1_W = _TARGET_H // 2, _TARGET_W // 2  # stage 2 -> target
+NUM_FRAMES = int(os.environ.get("LTX_FRAMES", "121"))  # 8k + 1
 FRAME_RATE = 24.0
 
 TDEV = torch.device("xpu", int(os.environ.get("LTX_TDEV", "0")))  # transformer
