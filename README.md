@@ -418,6 +418,159 @@ Output: `/home/lm/ltx23-run/output.mp4`.
 
 ---
 
+## Web Service (FastAPI)
+
+A FastAPI server provides a shared web UI + REST API for text-to-video generation
+on 32 Intel Arc B60 XPUs. All state is kept server-side and broadcast to all
+connected clients via Server-Sent Events (SSE) — browsers are pure viewers with
+no per-connection state.
+
+### Architecture
+
+```
+Browser ─── SSE (/api/events) ◀─── FastAPI ─── LtxWorker (single) ─── Popen ─── run_t2v_xpu_perf.py
+             │                                │                              (live stdout → state)
+             │                                └── MultiLtxWorker ─── Popen x8 ─── run_t2v_xpu_perf.py
+             │                                                                  (logs → state)
+             └──── POST /api/jobs ──► Server ─── queue ──► worker
+```
+
+- **Single job** — `LtxWorker` spawns one subprocess on `xpu:0`+`xpu:1` (same as
+  `run_b.sh` config: 1024×1024, 121 frames, Gemma on CPU). Subprocess stdout is
+  read line-by-line into a thread-safe in-memory log buffer (`ServerState`).
+- **Multi job (8×)** — `MultiLtxWorker` spawns 8 staggered subprocesses on
+  `xpu:0..15` (pairs: (0,1), (2,3), …, (14,15)). Prompts are pre-encoded by
+  `encode_prompts.py` (one shared Gemma instance on CPU). Per-worker log files
+  are tailed every 2 s for real-time progress.
+- **SSE broadcast** — All clients connect to `/api/events` (no auth required).
+  The server emits the full state snapshot (active jobs, logs, progress, XPU
+  telemetry, history) every ~0.8 s. Client JS renders the DOM from the snapshot
+  without any per-connection polling or state variables.
+- **Video serving** — `/api/jobs/{id}/video` and
+  `/api/multi-jobs/{id}/videos/{i}` serve MP4 files with HTTP Range support
+  (206 Partial Content) and `Content-Disposition: inline` for smooth in-browser
+  playback. No auth required on these video endpoints (browser `<video>` cannot
+  send Bearer tokens).
+
+### Modification steps (per-client polling → shared SSE broadcast)
+
+1. **Add `ServerState` class** — thread-safe shared state container holding
+   active single/multi job details, rotating log buffers (100 lines), worker
+   progress, cached history, and XPU telemetry. Writes via `threading.Lock`.
+2. **Rewrite `LtxWorker._spawn_generation()`** — replaced `subprocess.run()`
+   (blocking, captured output at end) with `subprocess.Popen()` + iterative
+   `stdout.readline()` for live log capture. Tqdm-like progress is parsed via
+   regex and written to state every line.
+3. **Rewrite `MultiLtxWorker._run()`** — replaced sequential `proc.wait()` loop
+   with a polling loop that checks `proc.poll()` every 2 s and reads the tail of
+   each worker's `.log` file for real-time status. Worker grid and orchestrator
+   logs are written to state as workers spawn/finish.
+4. **Add SSE endpoint** — `GET /api/events` returns a `StreamingResponse` with
+   `text/event-stream`. An async generator polls `state.snapshot()` every 0.8 s
+   and yields `data: <json>\n\n` only when state changes.
+5. **Add history refresh** — background daemon thread reloads recent jobs from
+   SQLite into `state.single_history` / `state.multi_history` every 5 s.
+6. **Rewrite HTML/JS** — removed all client-side state variables
+   (`currentSingleJob`, `currentMultiJobs`, timers) and polling logic.
+   `EventSource('/api/events')` drives all rendering via a single
+   `renderAll(state)` call. Video elements use `dataset` caches to avoid
+   DOM rebuild on every SSE tick (prevents flicker).
+
+### Key files
+
+| File | Purpose |
+|------|---------|
+| `/home/lm/paul/ltx_server.py` | Entry point, instantiates `ModelProfile` |
+| `/home/lm/paul/ltx_server_common.py` | Server framework — all endpoints, HTML template, `ServerState`, workers |
+| `/home/lm/paul/start_ltx_server.sh` | Launch script |
+| `/home/lm/paul/ltx23-run/encode_prompts.py` | Shared Gemma prompt encoder (multi-job step 1) |
+| `/home/lm/paul/ltx23-run/run_multi_xpu.py` | 8-video launcher (orchestrator used by `MultiLtxWorker`) |
+| `/home/lm/paul/ltx23-run/run_multi_16.py` | 16-video launcher (xpu:0..31) — experimental |
+
+### Starting the server
+
+```bash
+# Kill old server, start fresh
+fuser -k 8001/tcp 2>/dev/null; sleep 2
+LTX_HOST=0.0.0.0 LTX_API_TOKEN=111 \
+  /home/lm/paul/ltx23-env/bin/python /home/lm/paul/ltx_server.py > server.log 2>&1 &
+disown
+```
+
+Access at `http://<host>:8001`. API token (`111` in this example) is required
+for all POST endpoints. The SSE endpoint and video endpoints need no auth.
+
+---
+
+## Multi-Worker Generation
+
+### `run_multi_xpu.py` — 8 concurrent videos (16 XPUs)
+
+Pre-encodes 8 prompts with a single Gemma instance on CPU (`encode_prompts.py`),
+then spawns 8 staggered workers on `xpu:0..15` (pairs (0,1), (2,3), … (14,15)).
+Stagger delay (default 5 s) avoids XPU driver contention during model build.
+
+**Usage:**
+```bash
+# With default prompts:
+LTX_GEMMA_DEVICE=cpu /home/lm/paul/ltx23-env/bin/python run_multi_xpu.py
+
+# Custom prompts via file:
+LTX_GEMMA_DEVICE=cpu /home/lm/paul/ltx23-env/bin/python run_multi_xpu.py \
+  --prompts-file multi_16_output/prompts.json --job-dir /tmp/my_job
+
+# Shell wrapper:
+./run_multi.sh
+```
+
+### `run_multi_16.py` — 16 concurrent videos (32 XPUs)
+
+Same approach but spawns 16 workers on `xpu:0..31` (pairs (0,16), (1,17), …
+(15,31)). **Experimental** — 16 concurrent transformer builds stress the XPU
+driver and have shown extremely slow per-step times (up to 18 min/step in testing).
+Stagger delay is 10 s.
+
+```bash
+LTX_GEMMA_DEVICE=cpu /home/lm/paul/ltx23-env/bin/python run_multi_16.py
+```
+
+---
+
+## Current Test Status
+
+### Single Video (via web server or CLI)
+
+| Config | Result | Date |
+|--------|--------|------|
+| 1024×1024, 121 frames, Gemma CPU, `run.sh` / `run_b.sh` | ✅ **Succeeded** ~2.5 min | 2026-07-16 |
+| Web server single job endpoint | ✅ Verified — subprocess spawns, live log streaming via SSE, progress tracked, video served with valid Range support | 2026-07-17 |
+
+### 8-Video Multi-Job (via web server or `run_multi_xpu.py`)
+
+| Test | Result | Wall time | Details |
+|------|--------|-----------|---------|
+| 8 prompts, 1024×1024, 121 fr, xpu:0..15, 5 s stagger | ✅ **8/8 succeeded** | ~2 min 53 s | Prompt encode ~7.4 s, spawn stagger ~35 s, generation ~130 s |
+| Web server multi-job endpoint | ✅ Verified — SSE shows real-time worker grid + orchestrator logs, gallery renders on completion, history shows links | 2026-07-17 |
+
+### 16-Video Multi-Job (experimental)
+
+| Test | Result | Details |
+|------|--------|---------|
+| 16 prompts, 1024×1024, 121 fr, xpu:0..31, 10 s stagger | ❌ **Interrupted — all workers killed by session timeout** | 16 workers spawned successfully, early workers showed extreme per-step times (18 min/step on worker 0, 73 s/step on worker 1). Likely driver contention from 16 concurrent model builds. |
+
+### Known issues
+
+- **73-frame hang** — Running 1024×1024 with 73 frames (`frames % 8 == 1`) hangs
+  the XPU driver at stage-2 denoising step 1. Root cause unknown. Use 121 frames
+  as the default (next valid value: 9, 17, 25, 41, 121, …).
+- **16-worker bottleneck** — 16 concurrent transformer builds exceed XPU driver
+  capacity. Stick to 8 workers for reliable generation.
+- **SSE connection drop** — Browsers may drop SSE after ~60 s of idle (no state
+  changes). Client auto-reconnects with 3 s backoff. Continuous log output
+  during a running job keeps the connection alive.
+
+---
+
 ## Configuration
 
 Edit the constants at the top of `run_t2v_xpu.py`:
