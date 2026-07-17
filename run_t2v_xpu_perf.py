@@ -57,7 +57,7 @@ SEED = 42
 _TARGET_W = int(os.environ.get("LTX_WIDTH", "1024"))
 _TARGET_H = int(os.environ.get("LTX_HEIGHT", "1024"))
 STAGE1_H, STAGE1_W = _TARGET_H // 2, _TARGET_W // 2  # stage 2 -> target
-NUM_FRAMES = int(os.environ.get("LTX_FRAMES", "121"))  # 8k + 1
+NUM_FRAMES = int(os.environ.get("LTX_FRAMES", "121"))  # 8k + 1 (73 hangs XPU driver)
 FRAME_RATE = 24.0
 
 TDEV = torch.device("xpu", int(os.environ.get("LTX_TDEV", "0")))  # transformer

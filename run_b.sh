@@ -10,7 +10,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$HERE"
 
-source /home/lm/ltx23-env/bin/activate
+PYTHON="/home/lm/paul/ltx23-env/bin/python"
 
 export HF_HUB_OFFLINE=1
 export TOKENIZERS_PARALLELISM=false
@@ -23,4 +23,4 @@ if [[ $# -ge 1 ]]; then
     export LTX_PROMPT="$1"
 fi
 
-exec python -u "$HERE/run_t2v_xpu_perf.py"
+exec "$PYTHON" -u "$HERE/run_t2v_xpu_perf.py"

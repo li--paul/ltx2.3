@@ -11,8 +11,8 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$HERE"
 
-# --- activate the uv venv ---
-source /home/lm/ltx23-env/bin/activate
+# --- python ---
+PYTHON="/home/lm/paul/ltx23-env/bin/python"
 
 # --- env ---
 export HF_HUB_OFFLINE=1
@@ -20,11 +20,11 @@ export TOKENIZERS_PARALLELISM=false
 export LTX_GEMMA_DEVICE=cpu
 export LTX_WIDTH="${LTX_WIDTH:-1024}"
 export LTX_HEIGHT="${LTX_HEIGHT:-1024}"
-export LTX_FRAMES="${LTX_FRAMES:-73}"
+export LTX_FRAMES="${LTX_FRAMES:-121}"
 
 # allow overriding the prompt from the first arg or an env var
 if [[ $# -ge 1 ]]; then
     export LTX_PROMPT="$1"
 fi
 
-exec python -u "$HERE/run_t2v_xpu_perf.py"
+exec "$PYTHON" -u "$HERE/run_t2v_xpu_perf.py"
