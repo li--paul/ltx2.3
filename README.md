@@ -558,6 +558,28 @@ LTX_GEMMA_DEVICE=cpu /home/lm/paul/ltx23-env/bin/python run_multi_16.py
 |------|--------|---------|
 | 16 prompts, 1024×1024, 121 fr, xpu:0..31, 10 s stagger | ❌ **Interrupted — all workers killed by session timeout** | 16 workers spawned successfully, early workers showed extreme per-step times (18 min/step on worker 0, 73 s/step on worker 1). Likely driver contention from 16 concurrent model builds. |
 
+### 16-Video Multi-Job Benchmark (10 consecutive runs)
+
+Test: 10 consecutive 16-video multi-jobs (160 total videos), each with different
+16 prompts (cycled from a 54-prompt pool), 1024×1024, 121 frames, 10 s stagger,
+device pairs `(i, i+16)`.
+
+| Metric | Value |
+|--------|-------|
+| Runs | 10 |
+| Passed | **9/10** |
+| Success rate (videos) | **159/160 (99.4%)** |
+| Avg wall time | **450.2 s (7.5 min)** — all 9 successful runs identical within 0.1 s |
+| Min / Max | 450.2 s / 450.2 s |
+| Per-video avg | 36.5 s |
+| Failed run | Run 10 — worker 1 (xpu:1+17) `UR_RESULT_ERROR_DEVICE_LOST` |
+
+All 144 videos from the 9 successful runs completed without any quality issues.
+The single failure was an intermittent XPU driver crash (`DEVICE_LOST` at
+`rope.py:156`), the same root cause seen in earlier 8-video tests. This is a
+~0.6 % per-video failure rate and purely driver-level — no evidence of thermal
+or memory exhaustion.
+
 ### Known issues
 
 - **73-frame hang** — Running 1024×1024 with 73 frames (`frames % 8 == 1`) hangs
@@ -804,6 +826,10 @@ whole caching allocator. Call `torch.xpu.empty_cache()` (no arg).
     ├── patches/xpu.patch               # the three XPU patches
     ├── sample-output.mp4               # Run A output (896×512, 41 frames)
     ├── sample-output-1024.mp4          # Run B output (1024×1024, 121 frames)
+    ├── ltx_server.py                   # FastAPI web server entry point
+    ├── ltx_server_common.py            # server framework (workers, SSE, state)
+    ├── start_ltx_server.sh             # web server launch script
+    ├── multi_benchmark.py              # 10-run benchmark script
     ├── run.log / perf.log              # last run logs (gitignored)
     └── output*.mp4                     # generated videos (gitignored)
 ```
